@@ -1,8 +1,8 @@
 (() => {
   'use strict';
 
-  const PLUGIN_ID = 'st-preset-weaver';
   const EXTENSION_KEY = 'stPresetWeaver';
+  const STORAGE_PREFIX = 'st-preset-weaver';
   const PROMPT_ORDER_ID = '100001';
 
   const state = {
@@ -64,26 +64,61 @@
     }
   }
 
-  async function api(path, method = 'GET', body) {
-    const contextValue = context();
-    if (!contextValue) throw new Error('SillyTavern context is unavailable.');
+  async function localStore() {
+    const store = window.SillyTavern?.libs?.localforage;
+    if (!store) throw new Error('SillyTavern localforage is unavailable.');
+    return store;
+  }
 
-    const response = await fetch(`/api/plugins/${PLUGIN_ID}${path}`, {
-      method,
-      credentials: 'same-origin',
-      headers: contextValue.getRequestHeaders(),
-      body: body === undefined ? undefined : JSON.stringify(body),
-    });
-    const payload = await response.json().catch(() => ({}));
-    if (!response.ok) throw new Error(payload.error || `Request failed: ${response.status}`);
-    return payload;
+  async function storageKey() {
+    const contextValue = context();
+    if (!contextValue?.extensionSettings) throw new Error('SillyTavern extension settings are unavailable.');
+
+    const settings = contextValue.extensionSettings;
+    settings[EXTENSION_KEY] = settings[EXTENSION_KEY] || {};
+    if (!settings[EXTENSION_KEY].storageKey) {
+      settings[EXTENSION_KEY].storageKey = contextValue.uuidv4();
+      contextValue.saveSettingsDebounced();
+    }
+    return `${STORAGE_PREFIX}:${settings[EXTENSION_KEY].storageKey}`;
+  }
+
+  function normalizeState(input) {
+    const result = defaultServerState();
+    if (!input || typeof input !== 'object') return result;
+    for (const key of ['modules', 'groups', 'presets']) {
+      if (input[key] && typeof input[key] === 'object' && !Array.isArray(input[key])) {
+        result[key] = input[key];
+      }
+    }
+    if (Array.isArray(input.backups)) result.backups = input.backups;
+    if (input.settings && typeof input.settings === 'object') {
+      result.settings = {
+        ...result.settings,
+        ...input.settings,
+        autoBackup: input.settings.autoBackup === true,
+        backupRetention: Math.max(1, Math.min(500, Number(input.settings.backupRetention) || 50)),
+        theme: input.settings.theme === 'light' ? 'light' : 'dark',
+      };
+    }
+    return result;
+  }
+
+  async function loadState() {
+    const store = await localStore();
+    return normalizeState(await store.getItem(await storageKey()));
+  }
+
+  async function persistState() {
+    const store = await localStore();
+    await store.setItem(await storageKey(), clone(state.serverState));
   }
 
   function queueServerStateSave() {
     clearTimeout(state.saveTimer);
     state.saveTimer = setTimeout(async () => {
       try {
-        await api('/state', 'PUT', state.serverState);
+        await persistState();
       } catch (error) {
         setStatus(error.message, 'error');
         notify(error.message, 'error');
@@ -97,6 +132,7 @@
       modules: {},
       groups: {},
       presets: {},
+      backups: [],
       settings: {
         autoBackup: true,
         backupRetention: 50,
@@ -484,6 +520,7 @@
           <button class="pw-button" id="pwExportButton" type="button">导出全部数据</button>
           <label class="pw-button" style="display:flex; align-items:center;">导入<input id="pwImportInput" class="pw-hidden" type="file" accept="application/json"></label>
         </div></div>
+        <div class="pw-field"><label>存储说明</label><div>数据保存在当前浏览器的 SillyTavern 本地存储中；跨设备迁移请使用导出/导入。</div></div>
       </div>
     `;
   }
@@ -506,13 +543,11 @@
     document.querySelector('#pwSearch').value = state.search;
     document.querySelector('#pwSearch').placeholder = state.view === 'modules' ? '搜索模块...' : '搜索...';
     if (!state.ready) {
-      document.querySelector('#pwList').innerHTML = '<div class="pw-empty">正在连接 Server Plugin...</div>';
+      document.querySelector('#pwList').innerHTML = '<div class="pw-empty">正在加载本地数据...</div>';
       document.querySelector('#pwRight').innerHTML = `
         <div class="pw-empty">
-          <strong>Preset Weaver 需要 Server Plugin。</strong><br>
-          请安装 <code>server-plugin/index.cjs</code> 到
-          <code>plugins/st-preset-weaver/</code>，并在 <code>config.yaml</code> 中启用
-          <code>enableServerPlugins: true</code>。
+          <strong>正在加载本地数据。</strong><br>
+          如果长时间停留在这里，请检查浏览器是否允许 SillyTavern 使用 IndexedDB/localStorage。
         </div>
       `;
       setStatus(state.status, state.statusType);
@@ -564,13 +599,21 @@
   async function backupPreset(name, kind = 'auto') {
     const preset = getPreset(name);
     if (!preset) throw new Error(`无法读取预设 ${name}`);
-    return await api('/backups', 'POST', {
+    const record = {
       kind,
       source: kind,
       presetName: name,
       preset: clone(preset),
-      retention: state.serverState.settings.backupRetention,
-    });
+      id: context().uuidv4(),
+      createdAt: new Date().toISOString(),
+    };
+    state.serverState.backups.unshift(record);
+    while (state.serverState.backups.length > state.serverState.settings.backupRetention) {
+      state.serverState.backups.pop();
+    }
+    await persistState();
+    state.backups = clone(state.serverState.backups);
+    return clone(record);
   }
 
   async function savePresetObject(name, preset) {
@@ -613,7 +656,7 @@
       }
     }
 
-    state.backups = await api('/backups');
+    await refreshBackups();
     render();
     setStatus(`已同步 ${synced} 个预设`, 'ok');
     if (errors.length) notify(errors.join('\n'), 'error');
@@ -660,7 +703,7 @@
       path: EXTENSION_KEY,
       value: extension,
     });
-    await api('/state', 'PUT', state.serverState);
+    await persistState();
     state.view = 'modules';
     state.selectedModule = moduleId;
     render();
@@ -715,7 +758,7 @@
     manager.selectPreset(value);
     state.selectedPreset = name;
     presetMeta(name).lastUsed = Date.now();
-    await api('/state', 'PUT', state.serverState);
+    await persistState();
     render();
     setStatus(`已切换到 ${name}`, 'ok');
   }
@@ -723,17 +766,18 @@
   async function restoreBackup() {
     const record = state.backups.find(item => item.id === state.selectedBackup);
     if (!record) return;
-    const backup = await api(`/backups/${record.id}`);
+    const backup = clone(state.serverState.backups.find(item => item.id === record.id));
+    if (!backup) throw new Error('备份不存在。');
     const targetName = record.presetName || currentPresetName();
     if (state.serverState.settings.autoBackup) await backupPreset(currentPresetName(), 'auto');
     await savePresetObject(targetName, clone(backup.preset));
-    state.backups = await api('/backups');
+    await refreshBackups();
     render();
     setStatus(`已恢复 ${targetName}`, 'ok');
   }
 
   async function refreshBackups() {
-    state.backups = await api('/backups');
+    state.backups = clone(state.serverState.backups || []);
   }
 
   async function savePresetTags(name, tags) {
@@ -826,7 +870,7 @@
       render();
     });
     document.querySelector('#pwRefreshButton').addEventListener('click', async () => {
-      state.serverState = await api('/state');
+      state.serverState = await loadState();
       await refreshBackups();
       render();
     });
@@ -896,7 +940,7 @@
           module.role = document.querySelector('#pwModuleRole').value;
           module.content = document.querySelector('#pwModuleContent').value;
           module.updatedAt = Date.now();
-          await api('/state', 'PUT', state.serverState);
+          await persistState();
           renderList();
           setStatus('模块已保存，请确认同步范围', 'ok');
           openSyncDialog(module.id);
@@ -908,7 +952,7 @@
             await removeModuleBindings(moduleId);
             delete state.serverState.modules[moduleId];
             state.selectedModule = '';
-            await api('/state', 'PUT', state.serverState);
+            await persistState();
             render();
             setStatus('模块已删除并解除绑定', 'ok');
           });
@@ -920,7 +964,7 @@
           confirmAction('删除分组', '只删除分组，不会修改组内模块或预设。', async () => {
             delete state.serverState.groups[groupId];
             state.selectedGroup = '';
-            await api('/state', 'PUT', state.serverState);
+            await persistState();
             render();
           });
         },
@@ -928,7 +972,8 @@
         pwDeleteBackup: async () => {
           const backupId = state.selectedBackup;
           confirmAction('删除备份', '备份删除后不可恢复。', async () => {
-            await api(`/backups/${backupId}`, 'DELETE');
+            state.serverState.backups = state.serverState.backups.filter(item => item.id !== backupId);
+            await persistState();
             state.selectedBackup = '';
             await refreshBackups();
             render();
@@ -941,7 +986,12 @@
           render();
           setStatus('已创建手动备份', 'ok');
         },
-        pwExportButton: async () => downloadExport(await api('/export')),
+        pwExportButton: async () => downloadExport({
+          schemaVersion: 1,
+          exportedAt: new Date().toISOString(),
+          state: clone(state.serverState),
+          backups: clone(state.serverState.backups || []),
+        }),
       };
 
       if (actions[event.target.id]) await actions[event.target.id]();
@@ -990,11 +1040,13 @@
         const file = event.target.files[0];
         const payload = JSON.parse(await file.text());
         confirmAction('导入数据', '导入会替换当前用户的模块库、分组、使用记录和备份清单。', async () => {
-          const result = await api('/import', 'POST', payload);
-          state.serverState = result.state;
+          const imported = normalizeState(payload.state);
+          imported.backups = Array.isArray(payload.backups) ? payload.backups : imported.backups;
+          state.serverState = imported;
+          await persistState();
           await refreshBackups();
           render();
-          notify(`导入完成，备份 ${result.importedBackups} 份。`, 'success');
+          notify(`导入完成，备份 ${imported.backups.length} 份。`, 'success');
         }, '导入');
       }
     });
@@ -1036,14 +1088,14 @@
     render();
 
     try {
-      state.serverState = await api('/state');
+      state.serverState = await loadState();
       await refreshBackups();
       state.ready = true;
-      setStatus('已连接 Server Plugin', 'ok');
+      setStatus('本地数据已加载', 'ok');
       render();
     } catch (error) {
-      setStatus('Server Plugin 未连接', 'error');
-      notify('Preset Weaver 需要 Server Plugin。请将 server-plugin/index.cjs 安装到 plugins/st-preset-weaver/，并启用 enableServerPlugins。', 'error');
+      setStatus('本地数据加载失败', 'error');
+      notify(error.message || '浏览器本地存储不可用。', 'error');
       render();
     }
   }
