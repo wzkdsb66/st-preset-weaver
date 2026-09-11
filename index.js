@@ -86,12 +86,54 @@
   function normalizeState(input) {
     const result = defaultServerState();
     if (!input || typeof input !== 'object') return result;
+    const tags = value => Array.isArray(value)
+      ? [...new Set(value.map(item => String(item).trim()).filter(Boolean))]
+      : [];
+    const isRecord = value => value && typeof value === 'object' && !Array.isArray(value);
+
     for (const key of ['modules', 'groups', 'presets']) {
-      if (input[key] && typeof input[key] === 'object' && !Array.isArray(input[key])) {
+      if (isRecord(input[key])) {
         result[key] = input[key];
       }
     }
-    if (Array.isArray(input.backups)) result.backups = input.backups;
+
+    result.modules = Object.fromEntries(Object.entries(result.modules)
+      .filter(([id, module]) => typeof id === 'string' && isRecord(module))
+      .map(([id, module]) => [id, {
+        ...module,
+        id,
+        name: String(module.name || '未命名模块'),
+        tags: tags(module.tags),
+        role: ['system', 'user', 'assistant'].includes(module.role) ? module.role : 'system',
+        content: String(module.content || ''),
+        injection_trigger: Array.isArray(module.injection_trigger) ? clone(module.injection_trigger) : [],
+      }]));
+
+    result.groups = Object.fromEntries(Object.entries(result.groups)
+      .filter(([id, group]) => typeof id === 'string' && isRecord(group))
+      .map(([id, group]) => [id, {
+        ...group,
+        id,
+        name: String(group.name || '未命名分组'),
+        moduleIds: [...new Set((Array.isArray(group.moduleIds) ? group.moduleIds : [])
+          .filter(moduleId => result.modules[moduleId]))],
+      }]));
+
+    result.presets = Object.fromEntries(Object.entries(result.presets)
+      .filter(([name, meta]) => typeof name === 'string' && isRecord(meta))
+      .map(([name, meta]) => [name, {
+        ...meta,
+        tags: tags(meta.tags),
+        lastUsed: Number(meta.lastUsed) || 0,
+      }]));
+
+    if (Array.isArray(input.backups)) {
+      result.backups = input.backups.filter(record => isRecord(record)
+        && typeof record.id === 'string'
+        && typeof record.createdAt === 'string'
+        && isRecord(record.preset));
+    }
+
     if (input.settings && typeof input.settings === 'object') {
       result.settings = {
         ...result.settings,
@@ -327,6 +369,7 @@
       const current = currentPresetName();
       const names = filteredPresets();
       list.innerHTML = names.length ? names.map(name => {
+        const meta = presetMeta(name);
         const tags = presetTags(name);
         return `
           <div class="pw-card ${name === current ? 'active' : ''}" data-preset="${escapeHtml(name)}">
@@ -366,7 +409,12 @@
       const groups = Object.values(state.serverState.groups);
       list.innerHTML = groups.length ? groups.map(group => `
         <div class="pw-card ${group.id === state.selectedGroup ? 'active' : ''}" data-group="${group.id}">
-          <div class="pw-card-top"><div class="pw-name">${escapeHtml(group.name)}</div></div>
+          <div class="pw-card-top">
+            <div class="pw-name">${escapeHtml(group.name)}</div>
+            <label class="pw-meta" onclick="event.stopPropagation()">
+              <input type="checkbox" data-group-toggle="${group.id}" ${group.enabled === true ? 'checked' : ''}>
+            </label>
+          </div>
           <div class="pw-tags"><span class="pw-tag">${group.moduleIds.length} 个模块</span></div>
         </div>
       `).join('') : '<div class="pw-empty">还没有分组</div>';
@@ -618,6 +666,7 @@
 
   async function savePresetObject(name, preset) {
     const manager = chatCompletionManager();
+    if (!manager) throw new Error('聊天补全预设管理器不可用。');
     await manager.savePreset(name, preset, { skipUpdate: true });
     if (name === currentPresetName()) manager.updateList(name, preset);
   }
@@ -644,10 +693,12 @@
           role: module.role,
           content: module.content,
           system_prompt: Boolean(module.system_prompt),
+          position: module.position ?? prompt.position,
           injection_position: module.injection_position ?? prompt.injection_position,
           injection_depth: module.injection_depth ?? prompt.injection_depth,
           injection_order: module.injection_order ?? prompt.injection_order,
           forbid_overrides: Boolean(module.forbid_overrides),
+          injection_trigger: clone(module.injection_trigger || []),
         });
         await savePresetObject(name, preset);
         synced += 1;
@@ -729,12 +780,52 @@
     await togglePrompt(identifier, enabled);
   }
 
+  async function createModuleBinding(name, moduleId) {
+    const module = state.serverState.modules[moduleId];
+    const preset = getPreset(name);
+    if (!module || !preset) throw new Error('无法应用模块：预设或模块不存在。');
+
+    const existingIdentifier = boundIdentifier(preset, moduleId);
+    if (existingIdentifier) return existingIdentifier;
+
+    let identifier = `pw_${moduleId}`;
+    if (preset.prompts.some(prompt => prompt?.identifier === identifier)) {
+      identifier = `pw_${moduleId}_${Date.now()}`;
+    }
+    const now = Date.now();
+    preset.prompts = preset.prompts || [];
+    preset.prompts.push({
+      identifier,
+      name: module.name || '未命名模块',
+      role: module.role,
+      content: module.content,
+      system_prompt: Boolean(module.system_prompt),
+      position: module.position,
+      injection_position: module.injection_position,
+      injection_depth: module.injection_depth,
+      injection_order: module.injection_order,
+      forbid_overrides: Boolean(module.forbid_overrides),
+      injection_trigger: clone(module.injection_trigger || []),
+      marker: false,
+    });
+    setPromptEnabled(preset, identifier, true);
+
+    const extension = clone(extensionData(preset));
+    extension.schemaVersion = 1;
+    extension.modules = extension.modules || {};
+    extension.modules[identifier] = { moduleId, boundAt: now };
+    preset.extensions = { ...(preset.extensions || {}), [EXTENSION_KEY]: extension };
+    await savePresetObject(name, preset);
+    return identifier;
+  }
+
   async function toggleGroup(groupId, enabled) {
     const name = currentPresetName();
     const group = state.serverState.groups[groupId];
     const preset = getPreset(name);
     if (!group || !preset) return;
     if (state.serverState.settings.autoBackup) await backupPreset(name, 'auto');
+    group.enabled = enabled;
 
     let affected = 0;
     for (const moduleId of group.moduleIds) {
@@ -769,8 +860,12 @@
     const backup = clone(state.serverState.backups.find(item => item.id === record.id));
     if (!backup) throw new Error('备份不存在。');
     const targetName = record.presetName || currentPresetName();
-    if (state.serverState.settings.autoBackup) await backupPreset(currentPresetName(), 'auto');
-    await savePresetObject(targetName, clone(backup.preset));
+    const target = getPreset(targetName);
+    if (!target) throw new Error(`无法读取预设 ${targetName}`);
+    if (state.serverState.settings.autoBackup) await backupPreset(targetName, 'auto');
+    for (const key of Object.keys(target)) delete target[key];
+    Object.assign(target, clone(backup.preset));
+    await savePresetObject(targetName, target);
     await refreshBackups();
     render();
     setStatus(`已恢复 ${targetName}`, 'ok');
@@ -898,12 +993,7 @@
       if (state.view === 'modules') createNewModule();
     });
     document.querySelector('#pwList').addEventListener('click', async event => {
-      const moduleToggle = event.target.closest('[data-module-toggle]');
       const card = event.target.closest('[data-preset],[data-module],[data-group],[data-backup]');
-      if (moduleToggle) {
-        await toggleModule(moduleToggle.dataset.moduleToggle, moduleToggle.checked);
-        return;
-      }
       if (!card) return;
       if (card.dataset.preset) {
         await switchPreset(card.dataset.preset);
@@ -924,6 +1014,9 @@
     document.querySelector('#pwList').addEventListener('change', event => {
       const toggle = event.target.closest('[data-module-toggle]');
       if (toggle) toggleModule(toggle.dataset.moduleToggle, toggle.checked);
+
+      const groupToggle = event.target.closest('[data-group-toggle]');
+      if (groupToggle) toggleGroup(groupToggle.dataset.groupToggle, groupToggle.checked);
     });
     document.querySelector('#pwRight').addEventListener('click', async event => {
       const extract = event.target.closest('[data-extract]');
@@ -945,7 +1038,21 @@
           setStatus('模块已保存，请确认同步范围', 'ok');
           openSyncDialog(module.id);
         },
-        pwApplyModule: () => syncModule(state.selectedModule, [currentPresetName()]),
+        pwApplyModule: async () => {
+          const name = currentPresetName();
+          const preset = getPreset(name);
+          if (!name || !preset || !state.selectedModule) return;
+          if (state.serverState.settings.autoBackup) await backupPreset(name, 'auto');
+          const identifier = boundIdentifier(preset, state.selectedModule);
+          if (identifier) {
+            await syncModule(state.selectedModule, [name]);
+          } else {
+            await createModuleBinding(name, state.selectedModule);
+            await refreshBackups();
+            render();
+            setStatus('模块已应用并绑定到当前预设', 'ok');
+          }
+        },
         pwDeleteModule: async () => {
           const moduleId = state.selectedModule;
           confirmAction('删除模块', '模块会从模块库删除，并解除所有预设绑定；预设中的原提示词内容不会被删除。', async () => {
@@ -1038,16 +1145,20 @@
       }
       if (event.target.id === 'pwImportInput' && event.target.files?.[0]) {
         const file = event.target.files[0];
-        const payload = JSON.parse(await file.text());
-        confirmAction('导入数据', '导入会替换当前用户的模块库、分组、使用记录和备份清单。', async () => {
-          const imported = normalizeState(payload.state);
-          imported.backups = Array.isArray(payload.backups) ? payload.backups : imported.backups;
-          state.serverState = imported;
-          await persistState();
-          await refreshBackups();
-          render();
-          notify(`导入完成，备份 ${imported.backups.length} 份。`, 'success');
-        }, '导入');
+        try {
+          const payload = JSON.parse(await file.text());
+          confirmAction('导入数据', '导入会替换当前用户的模块库、分组、使用记录和备份清单。', async () => {
+            const imported = normalizeState(payload.state);
+            imported.backups = Array.isArray(payload.backups) ? payload.backups : imported.backups;
+            state.serverState = imported;
+            await persistState();
+            await refreshBackups();
+            render();
+            notify(`导入完成，备份 ${imported.backups.length} 份。`, 'success');
+          }, '导入');
+        } catch {
+          notify('导入文件不是有效的 JSON。', 'error');
+        }
       }
     });
     document.querySelector('#pwDialogCancel').addEventListener('click', closeDialog);
