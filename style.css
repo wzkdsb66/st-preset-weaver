@@ -85,6 +85,13 @@
   padding: 15px 18px;
   border-bottom: 1px solid var(--pw-border);
   background: var(--pw-surface);
+  cursor: move;
+  touch-action: none;
+  user-select: none;
+}
+
+.pw-header .pw-icon-btn {
+  cursor: pointer;
 }
 
 .pw-title {

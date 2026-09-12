@@ -4,6 +4,7 @@
   const EXTENSION_KEY = 'stPresetWeaver';
   const STORAGE_PREFIX = 'st-preset-weaver';
   const PROMPT_ORDER_ID = '100001';
+  const COMMON_TAGS = ['常用', '角色扮演', '文笔', 'NSFW', '系统', '规则', '剧情', '战斗'];
 
   const state = {
     open: false,
@@ -106,6 +107,8 @@
         tags: tags(module.tags),
         role: ['system', 'user', 'assistant'].includes(module.role) ? module.role : 'system',
         content: String(module.content || ''),
+        presetName: typeof module.presetName === 'string' ? module.presetName : '',
+        prompts: Array.isArray(module.prompts) ? clone(module.prompts) : undefined,
         injection_trigger: Array.isArray(module.injection_trigger) ? clone(module.injection_trigger) : [],
       }]));
 
@@ -239,6 +242,25 @@
     return Object.entries(modules).find(([, value]) => value?.moduleId === moduleId)?.[0] || null;
   }
 
+  function boundIdentifiers(preset, moduleId) {
+    const modules = extensionData(preset).modules || {};
+    return Object.entries(modules)
+      .filter(([, value]) => value?.moduleId === moduleId)
+      .map(([identifier]) => identifier);
+  }
+
+  function moduleEnabledState(preset, moduleId) {
+    const identifiers = boundIdentifiers(preset, moduleId);
+    if (!identifiers.length) return null;
+    return identifiers.every(identifier => promptEnabled(preset, identifier));
+  }
+
+  function commonTagChips(kind) {
+    return `<div class="pw-chip-row">${COMMON_TAGS.map(tag => `
+      <button class="pw-chip" data-tag-add="${kind}" data-tag="${escapeHtml(tag)}" type="button">${escapeHtml(tag)}</button>
+    `).join('')}</div>`;
+  }
+
   function moduleReferences(moduleId) {
     return allPresetNames().filter(name => Boolean(boundIdentifier(getPreset(name), moduleId)));
   }
@@ -335,7 +357,8 @@
       const matchesTag = !state.moduleTag || module.tags?.includes(state.moduleTag);
       const matchesQuery = !query
         || module.name?.toLowerCase().includes(query)
-        || module.content?.toLowerCase().includes(query);
+        || module.content?.toLowerCase().includes(query)
+        || module.presetName?.toLowerCase().includes(query);
       return matchesTag && matchesQuery;
     }).sort((left, right) => (left.name || '').localeCompare(right.name || ''));
   }
@@ -387,9 +410,8 @@
     if (state.view === 'modules') {
       const modules = filteredModules();
       const currentPreset = getPreset(currentPresetName());
-      list.innerHTML = modules.length ? modules.map(module => {
-        const identifier = boundIdentifier(currentPreset, module.id);
-        const enabled = identifier ? promptEnabled(currentPreset, identifier) : null;
+     list.innerHTML = modules.length ? modules.map(module => {
+        const enabled = moduleEnabledState(currentPreset, module.id);
         return `
           <div class="pw-card ${module.id === state.selectedModule ? 'active' : ''}" data-module="${module.id}">
             <div class="pw-card-top">
@@ -398,7 +420,12 @@
                 ${enabled === null ? '未绑定' : `<input type="checkbox" data-module-toggle="${module.id}" ${enabled ? 'checked' : ''}>`}
               </label>
             </div>
-            <div class="pw-tags">${(module.tags || []).map(tag => `<span class="pw-tag">${escapeHtml(tag)}</span>`).join('')}</div>
+            <div class="pw-tags">${
+              [
+                ...(module.presetName ? [`私有：${escapeHtml(module.presetName)}`] : []),
+                ...(module.tags || []),
+              ].map(tag => `<span class="pw-tag">${escapeHtml(tag)}</span>`).join('')
+            }</div>
           </div>
         `;
       }).join('') : '<div class="pw-empty">还没有模块</div>';
@@ -451,23 +478,23 @@
         <div class="pw-field">
           <label>标签（逗号分隔）</label>
           <input class="pw-input" id="pwPresetTags" value="${escapeHtml(presetTags(name).join(', '))}">
+          ${commonTagChips('preset')}
         </div>
         <div class="pw-field"><label>上次使用</label><div>${relativeTime(metadata.lastUsed)}</div></div>
         <div class="pw-field"><label>非 marker 提示词条目（${nonMarkers.length}）</label></div>
         <div class="pw-list">
           ${nonMarkers.map(prompt => {
             const enabled = promptEnabled(preset, prompt.identifier);
-            const link = extensionData(preset).modules?.[prompt.identifier];
             return `
               <div class="pw-switch-row">
                 <input type="checkbox" data-prompt-toggle="${escapeHtml(prompt.identifier)}" ${enabled ? 'checked' : ''}>
                 <span>${escapeHtml(prompt.name || prompt.identifier)}</span>
-                <button class="pw-button small" style="margin-left:auto" data-extract="${escapeHtml(prompt.identifier)}" type="button">
-                  ${link ? '已绑定' : '提取'}
-                </button>
               </div>
             `;
           }).join('')}
+        </div>
+        <div style="margin-top:12px;">
+          <button class="pw-button primary" id="pwExtractAll" type="button">提取全部提示词为模块</button>
         </div>
       </div>
     `;
@@ -476,16 +503,31 @@
   function renderModuleRight() {
     const module = state.serverState.modules[state.selectedModule];
     if (!module) return '<div class="pw-empty">选择或创建一个模块。</div>';
+    const isPresetBundle = Array.isArray(module.prompts);
     return `
       <div class="pw-editor">
         <div class="pw-field"><label>模块名称</label><input class="pw-input" id="pwModuleName" value="${escapeHtml(module.name || '')}"></div>
-        <div class="pw-field"><label>模块标签（逗号分隔）</label><input class="pw-input" id="pwModuleTags" value="${escapeHtml((module.tags || []).join(', '))}"></div>
-        <div class="pw-field"><label>角色</label>
+        ${module.presetName ? `<div class="pw-field"><label>归属预设</label><div>${escapeHtml(module.presetName)}（私有，不可共享）</div></div>` : ''}
+        <div class="pw-field"><label>模块标签（逗号分隔）</label><input class="pw-input" id="pwModuleTags" value="${escapeHtml((module.tags || []).join(', '))}">${commonTagChips('module')}</div>
+        ${isPresetBundle ? '' : `<div class="pw-field"><label>角色</label>
           <select class="pw-input" id="pwModuleRole">
             ${['system', 'user', 'assistant'].map(role => `<option value="${role}" ${module.role === role ? 'selected' : ''}>${role}</option>`).join('')}
           </select>
-        </div>
-        <div class="pw-field"><label>内容</label><textarea class="pw-textarea" id="pwModuleContent">${escapeHtml(module.content || '')}</textarea></div>
+        </div>`}
+        ${isPresetBundle
+          ? `<div class="pw-field"><label>提示词条目（${module.prompts.length}）</label></div>
+            <div class="pw-list">
+              ${module.prompts.map((prompt, index) => `
+                <div class="pw-field">
+                  <label>${escapeHtml(prompt.name || prompt.identifier)} · ${escapeHtml(prompt.identifier || '')}</label>
+                  <select class="pw-input" data-module-prompt-role="${index}">
+                    ${['system', 'user', 'assistant'].map(role => `<option value="${role}" ${prompt.role === role ? 'selected' : ''}>${role}</option>`).join('')}
+                  </select>
+                  <textarea class="pw-textarea" data-module-prompt-content="${index}">${escapeHtml(prompt.content || '')}</textarea>
+                </div>
+              `).join('')}
+            </div>`
+          : `<div class="pw-field"><label>内容</label><textarea class="pw-textarea" id="pwModuleContent">${escapeHtml(module.content || '')}</textarea></div>`}
         <div style="display:flex; gap:8px;">
           <button class="pw-button primary" id="pwSaveModule" type="button">保存模块</button>
           <button class="pw-button" id="pwApplyModule" type="button">应用到当前预设</button>
@@ -680,26 +722,35 @@
     for (const name of presetNames) {
       try {
         const preset = getPreset(name);
-        const identifier = boundIdentifier(preset, moduleId);
-        const prompt = promptByIdentifier(preset, identifier);
-        if (!prompt) {
+        const identifiers = boundIdentifiers(preset, moduleId);
+        if (!identifiers.length) {
           errors.push(`${name}: 找不到绑定条目`);
           continue;
         }
 
         if (state.serverState.settings.autoBackup) await backupPreset(name, 'auto');
-        Object.assign(prompt, {
-          name: module.name || prompt.name,
-          role: module.role,
-          content: module.content,
-          system_prompt: Boolean(module.system_prompt),
-          position: module.position ?? prompt.position,
-          injection_position: module.injection_position ?? prompt.injection_position,
-          injection_depth: module.injection_depth ?? prompt.injection_depth,
-          injection_order: module.injection_order ?? prompt.injection_order,
-          forbid_overrides: Boolean(module.forbid_overrides),
-          injection_trigger: clone(module.injection_trigger || []),
-        });
+        for (const identifier of identifiers) {
+          const prompt = promptByIdentifier(preset, identifier);
+          if (!prompt) {
+            errors.push(`${name}: ${identifier} 不存在`);
+            continue;
+          }
+          const source = Array.isArray(module.prompts)
+            ? module.prompts.find(item => item?.identifier === identifier)
+            : null;
+          Object.assign(prompt, {
+            name: source?.name ?? module.name ?? prompt.name,
+            role: source?.role ?? module.role,
+            content: source?.content ?? module.content,
+            system_prompt: Boolean(source?.system_prompt ?? module.system_prompt),
+            position: source?.position ?? module.position ?? prompt.position,
+            injection_position: source?.injection_position ?? module.injection_position ?? prompt.injection_position,
+            injection_depth: source?.injection_depth ?? module.injection_depth ?? prompt.injection_depth,
+            injection_order: source?.injection_order ?? module.injection_order ?? prompt.injection_order,
+            forbid_overrides: Boolean(source?.forbid_overrides ?? module.forbid_overrides),
+            injection_trigger: clone(source?.injection_trigger ?? module.injection_trigger ?? []),
+          });
+        }
         await savePresetObject(name, preset);
         synced += 1;
       } catch (error) {
@@ -761,6 +812,55 @@
     setStatus('模块已提取并绑定', 'ok');
   }
 
+  async function extractAllPrompts(name) {
+    const contextValue = context();
+    const preset = getPreset(name);
+    if (!preset) return;
+    const nonMarkers = (preset.prompts || []).filter(prompt => !prompt?.marker);
+    if (!nonMarkers.length) {
+      notify('没有可提取的非 marker 提示词。');
+      return;
+    }
+
+    const existing = Object.values(state.serverState.modules).find(module => module.presetName === name);
+    const moduleId = existing?.id || contextValue.uuidv4();
+    const now = Date.now();
+    const promptsClone = nonMarkers.map(prompt => clone(prompt));
+    const module = {
+      ...(existing || {}),
+      id: moduleId,
+      name: existing?.name || `${name} 全部提示词`,
+      tags: existing?.tags || [],
+      role: 'system',
+      content: promptsClone.map(prompt => `### ${prompt.identifier || prompt.name}\n${prompt.content || ''}`).join('\n\n'),
+      system_prompt: false,
+      injection_trigger: [],
+      presetName: name,
+      prompts: promptsClone,
+      createdAt: existing?.createdAt || now,
+      updatedAt: now,
+    };
+
+    if (state.serverState.settings.autoBackup) await backupPreset(name, 'auto');
+    state.serverState.modules[moduleId] = module;
+    const extension = clone(extensionData(preset));
+    extension.schemaVersion = 1;
+    extension.modules = extension.modules || {};
+    for (const prompt of nonMarkers) {
+      extension.modules[prompt.identifier] = { moduleId, boundAt: now };
+    }
+    await contextValue.getPresetManager('openai').writePresetExtensionField({
+      name,
+      path: EXTENSION_KEY,
+      value: extension,
+    });
+    await persistState();
+    state.view = 'modules';
+    state.selectedModule = moduleId;
+    render();
+    setStatus('已提取全部提示词为预设私有模块', 'ok');
+  }
+
   async function togglePrompt(identifier, enabled) {
     const name = currentPresetName();
     const preset = getPreset(name);
@@ -775,9 +875,19 @@
   async function toggleModule(moduleId, enabled) {
     const name = currentPresetName();
     const preset = getPreset(name);
-    const identifier = boundIdentifier(preset, moduleId);
-    if (!preset || !identifier) return;
-    await togglePrompt(identifier, enabled);
+    const identifiers = boundIdentifiers(preset, moduleId);
+    if (!preset || !identifiers.length) return;
+    if (state.serverState.settings.autoBackup) await backupPreset(name, 'auto');
+    let affected = 0;
+    for (const identifier of identifiers) {
+      if (promptByIdentifier(preset, identifier)) {
+        setPromptEnabled(preset, identifier, enabled);
+        affected += 1;
+      }
+    }
+    await savePresetObject(name, preset);
+    render();
+    setStatus(`${enabled ? '开启' : '关闭'}了 ${affected} 个条目`, 'ok');
   }
 
   async function createModuleBinding(name, moduleId) {
@@ -785,38 +895,62 @@
     const preset = getPreset(name);
     if (!module || !preset) throw new Error('无法应用模块：预设或模块不存在。');
 
-    const existingIdentifier = boundIdentifier(preset, moduleId);
-    if (existingIdentifier) return existingIdentifier;
+    const existing = boundIdentifiers(preset, moduleId);
+    if (existing.length) return existing;
 
-    let identifier = `pw_${moduleId}`;
-    if (preset.prompts.some(prompt => prompt?.identifier === identifier)) {
-      identifier = `pw_${moduleId}_${Date.now()}`;
-    }
     const now = Date.now();
+    const sources = Array.isArray(module.prompts) && module.prompts.length
+      ? module.prompts
+      : [module];
     preset.prompts = preset.prompts || [];
-    preset.prompts.push({
-      identifier,
-      name: module.name || '未命名模块',
-      role: module.role,
-      content: module.content,
-      system_prompt: Boolean(module.system_prompt),
-      position: module.position,
-      injection_position: module.injection_position,
-      injection_depth: module.injection_depth,
-      injection_order: module.injection_order,
-      forbid_overrides: Boolean(module.forbid_overrides),
-      injection_trigger: clone(module.injection_trigger || []),
-      marker: false,
-    });
-    setPromptEnabled(preset, identifier, true);
-
+    const identifiers = [];
     const extension = clone(extensionData(preset));
     extension.schemaVersion = 1;
     extension.modules = extension.modules || {};
-    extension.modules[identifier] = { moduleId, boundAt: now };
+
+    for (const [index, source] of sources.entries()) {
+      let identifier = source?.identifier || `pw_${moduleId}_${index}`;
+      if (preset.prompts.some(prompt => prompt?.identifier === identifier)) {
+        identifier = `${identifier}_${Date.now()}`;
+      }
+      const prompt = promptByIdentifier(preset, source?.identifier);
+      if (prompt) {
+        Object.assign(prompt, {
+          name: source?.name ?? module.name ?? prompt.name,
+          role: source?.role ?? module.role,
+          content: source?.content ?? module.content,
+          system_prompt: Boolean(source?.system_prompt ?? module.system_prompt),
+          position: source?.position ?? module.position ?? prompt.position,
+          injection_position: source?.injection_position ?? module.injection_position ?? prompt.injection_position,
+          injection_depth: source?.injection_depth ?? module.injection_depth ?? prompt.injection_depth,
+          injection_order: source?.injection_order ?? module.injection_order ?? prompt.injection_order,
+          forbid_overrides: Boolean(source?.forbid_overrides ?? module.forbid_overrides),
+          injection_trigger: clone(source?.injection_trigger ?? module.injection_trigger ?? []),
+        });
+      } else {
+        preset.prompts.push({
+          identifier,
+          name: source?.name ?? module.name ?? '未命名模块',
+          role: source?.role ?? module.role,
+          content: source?.content ?? module.content,
+          system_prompt: Boolean(source?.system_prompt ?? module.system_prompt),
+          position: source?.position ?? module.position,
+          injection_position: source?.injection_position ?? module.injection_position,
+          injection_depth: source?.injection_depth ?? module.injection_depth,
+          injection_order: source?.injection_order ?? module.injection_order,
+          forbid_overrides: Boolean(source?.forbid_overrides ?? module.forbid_overrides),
+          injection_trigger: clone(source?.injection_trigger ?? module.injection_trigger ?? []),
+          marker: false,
+        });
+      }
+      setPromptEnabled(preset, identifier, true);
+      extension.modules[identifier] = { moduleId, boundAt: now };
+      identifiers.push(identifier);
+    }
+
     preset.extensions = { ...(preset.extensions || {}), [EXTENSION_KEY]: extension };
     await savePresetObject(name, preset);
-    return identifier;
+    return identifiers;
   }
 
   async function toggleGroup(groupId, enabled) {
@@ -894,10 +1028,11 @@
     for (const name of allPresetNames()) {
       const preset = getPreset(name);
       const extension = clone(extensionData(preset));
-      const identifier = Object.entries(extension.modules || {})
-        .find(([, value]) => value?.moduleId === moduleId)?.[0];
-      if (!identifier) continue;
-      delete extension.modules[identifier];
+      const identifiers = Object.entries(extension.modules || {})
+        .filter(([, value]) => value?.moduleId === moduleId)
+        .map(([identifier]) => identifier);
+      if (!identifiers.length) continue;
+      for (const identifier of identifiers) delete extension.modules[identifier];
       await manager.writePresetExtensionField({ name, path: EXTENSION_KEY, value: extension });
     }
   }
@@ -1019,19 +1154,53 @@
       if (groupToggle) toggleGroup(groupToggle.dataset.groupToggle, groupToggle.checked);
     });
     document.querySelector('#pwRight').addEventListener('click', async event => {
-      const extract = event.target.closest('[data-extract]');
-      if (extract) {
-        await createModuleFromPrompt(extract.dataset.extract);
+      const tagAdd = event.target.closest('[data-tag-add]');
+      if (tagAdd) {
+        const kind = tagAdd.dataset.tagAdd;
+        const tag = tagAdd.dataset.tag;
+        const input = document.querySelector(kind === 'preset' ? '#pwPresetTags' : '#pwModuleTags');
+        if (input) {
+          const values = input.value.split(',').map(value => value.trim()).filter(Boolean);
+          if (!values.includes(tag)) values.push(tag);
+          input.value = values.join(', ');
+          if (kind === 'preset') {
+            const name = state.selectedPreset || currentPresetName();
+            await savePresetTags(name, values);
+            queueServerStateSave();
+            renderTags();
+            renderList();
+          } else {
+            const module = state.serverState.modules[state.selectedModule];
+            if (module) {
+              module.tags = values;
+              queueServerStateSave();
+              renderList();
+            }
+          }
+        }
         return;
       }
 
       const actions = {
+        pwExtractAll: async () => {
+          const name = state.selectedPreset || currentPresetName();
+          await extractAllPrompts(name);
+        },
         pwSaveModule: async () => {
           const module = state.serverState.modules[state.selectedModule];
           module.name = document.querySelector('#pwModuleName').value.trim() || '未命名模块';
           module.tags = document.querySelector('#pwModuleTags').value.split(',').map(value => value.trim()).filter(Boolean);
-          module.role = document.querySelector('#pwModuleRole').value;
-          module.content = document.querySelector('#pwModuleContent').value;
+          if (Array.isArray(module.prompts)) {
+            module.prompts = module.prompts.map((prompt, index) => ({
+              ...prompt,
+              role: document.querySelector(`[data-module-prompt-role="${index}"]`)?.value || prompt.role,
+              content: document.querySelector(`[data-module-prompt-content="${index}"]`)?.value ?? prompt.content,
+            }));
+            module.content = module.prompts.map(prompt => `### ${prompt.identifier || prompt.name}\n${prompt.content || ''}`).join('\n\n');
+          } else {
+            module.role = document.querySelector('#pwModuleRole')?.value || module.role;
+            module.content = document.querySelector('#pwModuleContent')?.value ?? module.content;
+          }
           module.updatedAt = Date.now();
           await persistState();
           renderList();
@@ -1041,10 +1210,14 @@
         pwApplyModule: async () => {
           const name = currentPresetName();
           const preset = getPreset(name);
-          if (!name || !preset || !state.selectedModule) return;
+          const module = state.serverState.modules[state.selectedModule];
+          if (!name || !preset || !module) return;
+          if (module.presetName && module.presetName !== name) {
+            notify('该模块为预设私有，不能应用到其他预设。', 'warning');
+            return;
+          }
           if (state.serverState.settings.autoBackup) await backupPreset(name, 'auto');
-          const identifier = boundIdentifier(preset, state.selectedModule);
-          if (identifier) {
+          if (boundIdentifiers(preset, state.selectedModule).length) {
             await syncModule(state.selectedModule, [name]);
           } else {
             await createModuleBinding(name, state.selectedModule);
@@ -1182,6 +1355,45 @@
     contextValue.eventSource.on(contextValue.event_types.PRESET_CHANGED, handler);
   }
 
+  function bindDrag() {
+    const header = document.querySelector('.pw-header');
+    const windowEl = document.querySelector('#pwWindow');
+    if (!header || !windowEl) return;
+    let dragging = false;
+    let startX = 0;
+    let startY = 0;
+    let rect = null;
+
+    header.addEventListener('pointerdown', event => {
+      if (event.target.closest('.pw-icon-btn')) return;
+      dragging = true;
+      rect = windowEl.getBoundingClientRect();
+      startX = event.clientX;
+      startY = event.clientY;
+      windowEl.style.position = 'absolute';
+      windowEl.style.left = `${rect.left}px`;
+      windowEl.style.top = `${rect.top}px`;
+      windowEl.style.margin = '0';
+      header.setPointerCapture(event.pointerId);
+    });
+
+    header.addEventListener('pointermove', event => {
+      if (!dragging) return;
+      const left = Math.max(0, Math.min(window.innerWidth - windowEl.offsetWidth, rect.left + event.clientX - startX));
+      const top = Math.max(0, Math.min(window.innerHeight - windowEl.offsetHeight, rect.top + event.clientY - startY));
+      windowEl.style.left = `${left}px`;
+      windowEl.style.top = `${top}px`;
+    });
+
+    const stop = event => {
+      if (!dragging) return;
+      dragging = false;
+      try { header.releasePointerCapture(event.pointerId); } catch { /* pointer already released */ }
+    };
+    header.addEventListener('pointerup', stop);
+    header.addEventListener('pointercancel', stop);
+  }
+
   async function init() {
     const contextValue = context();
     if (!contextValue) {
@@ -1194,6 +1406,7 @@
     state.serverState = defaultServerState();
     render();
     bindShellEvents();
+    bindDrag();
     bindPresetEvents();
     state.selectedPreset = currentPresetName();
     render();
