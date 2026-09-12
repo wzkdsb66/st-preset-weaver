@@ -22,6 +22,7 @@
     status: '',
     statusType: '',
     saveTimer: 0,
+    fabDragged: false,
   };
 
   function context() {
@@ -284,7 +285,7 @@
 
   function injectShell() {
     document.body.insertAdjacentHTML('beforeend', `
-      <button id="pwFab" class="pw-fab" type="button" title="Preset Weaver">🧵</button>
+      <button id="pwFab" class="pw-fab" type="button" title="Preset Weaver"><svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><line x1="4" y1="21" x2="4" y2="14"/><line x1="4" y1="10" x2="4" y2="3"/><line x1="12" y1="21" x2="12" y2="12"/><line x1="12" y1="8" x2="12" y2="3"/><line x1="20" y1="21" x2="20" y2="16"/><line x1="20" y1="12" x2="20" y2="3"/><line x1="1" y1="14" x2="7" y2="14"/><line x1="9" y1="8" x2="15" y2="8"/><line x1="17" y1="16" x2="23" y2="16"/></svg></button>
       <div id="pwOverlay" class="pw-overlay">
         <div id="pwWindow" class="pw-window">
           <div class="pw-header">
@@ -471,6 +472,7 @@
 
     const prompts = preset.prompts || [];
     const nonMarkers = prompts.filter(prompt => !prompt.marker);
+    const changed = changedIdentifiers(name);
     const metadata = presetMeta(name);
     return `
       <div class="pw-editor">
@@ -485,9 +487,11 @@
         <div class="pw-list">
           ${nonMarkers.map(prompt => {
             const enabled = promptEnabled(preset, prompt.identifier);
+            const isChanged = changed.has(prompt.identifier);
             return `
-              <div class="pw-switch-row">
+              <div class="pw-switch-row ${isChanged ? 'pw-changed' : ''}">
                 <input type="checkbox" data-prompt-toggle="${escapeHtml(prompt.identifier)}" ${enabled ? 'checked' : ''}>
+                ${isChanged ? '<span class="pw-changed-mark" title="相比最近备份已修改">●</span>' : ''}
                 <span>${escapeHtml(prompt.name || prompt.identifier)}</span>
               </div>
             `;
@@ -600,7 +604,7 @@
     return `
       <div class="pw-editor">
         <div class="pw-section-title">插件设置</div>
-        <label class="pw-switch-row"><input id="pwAutoBackup" type="checkbox" ${settings.autoBackup ? 'checked' : ''}><span>覆盖、切换、恢复前自动备份</span></label>
+        <label class="pw-switch-row"><input id="pwAutoBackup" type="checkbox" ${settings.autoBackup ? 'checked' : ''}><span>修改前自动备份并对比变化</span></label>
         <div class="pw-field" style="margin-top:12px;"><label>备份保留数量（1–500）</label><input class="pw-input" id="pwRetention" type="number" min="1" max="500" value="${settings.backupRetention}"></div>
         <div class="pw-field"><label>主题</label><div style="display:flex; gap:8px;">
           <button class="pw-button ${settings.theme === 'dark' ? 'primary' : ''}" data-theme="dark" type="button">夜间</button>
@@ -762,6 +766,7 @@
     render();
     setStatus(`已同步 ${synced} 个预设`, 'ok');
     if (errors.length) notify(errors.join('\n'), 'error');
+    if (presetNames.includes(currentPresetName())) await showDiffDialog(currentPresetName());
   }
 
   async function createModuleFromPrompt(identifier) {
@@ -784,6 +789,8 @@
       role: prompt.role || 'system',
       content: prompt.content || '',
       system_prompt: Boolean(prompt.system_prompt),
+      sourceIdentifier: prompt.identifier,
+      presetName: name,
       position: prompt.position,
       injection_position: prompt.injection_position,
       injection_depth: prompt.injection_depth,
@@ -812,43 +819,49 @@
     setStatus('模块已提取并绑定', 'ok');
   }
 
-  async function extractAllPrompts(name) {
-    const contextValue = context();
-    const preset = getPreset(name);
-    if (!preset) return;
-    const nonMarkers = (preset.prompts || []).filter(prompt => !prompt?.marker);
-    if (!nonMarkers.length) {
-      notify('没有可提取的非 marker 提示词。');
-      return;
-    }
-
-    const existing = Object.values(state.serverState.modules).find(module => module.presetName === name);
-    const moduleId = existing?.id || contextValue.uuidv4();
-    const now = Date.now();
-    const promptsClone = nonMarkers.map(prompt => clone(prompt));
-    const module = {
-      ...(existing || {}),
-      id: moduleId,
-      name: existing?.name || `${name} 全部提示词`,
-      tags: existing?.tags || [],
-      role: 'system',
-      content: promptsClone.map(prompt => `### ${prompt.identifier || prompt.name}\n${prompt.content || ''}`).join('\n\n'),
-      system_prompt: false,
-      injection_trigger: [],
-      presetName: name,
-      prompts: promptsClone,
-      createdAt: existing?.createdAt || now,
-      updatedAt: now,
-    };
+ async function extractAllPrompts(name) {
+   const contextValue = context();
+   const preset = getPreset(name);
+   if (!preset) return;
+   const nonMarkers = (preset.prompts || []).filter(prompt => !prompt?.marker);
+   if (!nonMarkers.length) {
+     notify('没有可提取的非 marker 提示词。');
+     return;
+   }
 
     if (state.serverState.settings.autoBackup) await backupPreset(name, 'auto');
-    state.serverState.modules[moduleId] = module;
     const extension = clone(extensionData(preset));
     extension.schemaVersion = 1;
     extension.modules = extension.modules || {};
+    const now = Date.now();
+    const createdIds = [];
+
     for (const prompt of nonMarkers) {
+      if (extension.modules[prompt.identifier]) continue;
+      const moduleId = contextValue.uuidv4();
+      const module = {
+        id: moduleId,
+        name: prompt.name || prompt.identifier,
+        tags: [],
+        role: prompt.role || 'system',
+        content: prompt.content || '',
+        system_prompt: Boolean(prompt.system_prompt),
+        position: prompt.position,
+        sourceIdentifier: prompt.identifier,
+        presetName: name,
+        injection_position: prompt.injection_position,
+        injection_depth: prompt.injection_depth,
+        injection_order: prompt.injection_order,
+        forbid_overrides: Boolean(prompt.forbid_overrides),
+        injection_trigger: clone(prompt.injection_trigger || []),
+        createdAt: now,
+        updatedAt: now,
+      };
+      state.serverState.modules[moduleId] = module;
       extension.modules[prompt.identifier] = { moduleId, boundAt: now };
+      createdIds.push(moduleId);
     }
+
     await contextValue.getPresetManager('openai').writePresetExtensionField({
       name,
       path: EXTENSION_KEY,
@@ -856,9 +869,90 @@
     });
     await persistState();
     state.view = 'modules';
-    state.selectedModule = moduleId;
+    state.selectedModule = createdIds[0] || '';
     render();
-    setStatus('已提取全部提示词为预设私有模块', 'ok');
+    setStatus(`已提取 ${createdIds.length} 个提示词模块`, 'ok');
+    if (!createdIds.length) notify('该预设的提示词已全部提取。');
+  }
+
+  async function showDiffDialog(name) {
+    const backup = latestBackupFor(name);
+    const current = getPreset(name);
+    if (!backup || !current) return;
+    const changes = diffPreset(backup.preset, current);
+    if (!changes.length) {
+      setStatus('未检测到提示词内容变化', 'ok');
+      return;
+    }
+    const fieldLabels = {
+      name: '名称',
+      role: '角色',
+      content: '内容',
+      enabled: '开关',
+      system_prompt: '系统提示',
+      injection_position: '注入位置',
+      injection_depth: '注入深度',
+      injection_order: '注入顺序',
+      forbid_overrides: '禁止覆盖',
+    };
+    openDialog(`修改对比：${name}`, `
+      <div class="pw-diff-list">
+        ${changes.map(change => {
+          const label = change.type === 'added' ? '新增' : change.type === 'removed' ? '删除' : '修改';
+          const fields = (change.fields || []).map(field => fieldLabels[field] || field).join('、');
+          return `
+            <div class="pw-diff-item">
+              <span class="pw-diff-badge pw-diff-${change.type}">${label}</span>
+              <span class="pw-diff-name">${escapeHtml(change.name || change.identifier)}</span>
+              ${fields ? `<span class="pw-diff-fields">${escapeHtml(fields)}</span>` : ''}
+            </div>
+          `;
+        }).join('')}
+      </div>
+    `, '知道了');
+    document.querySelector('#pwDialogAccept').onclick = closeDialog;
+  }
+
+  function latestBackupFor(name) {
+    return (state.serverState.backups || []).find(record => record.presetName === name) || null;
+  }
+
+  function diffPreset(before, after) {
+    const beforePrompts = before?.prompts || [];
+    const afterPrompts = after?.prompts || [];
+    const identifiers = [...new Set([
+      ...beforePrompts.map(prompt => prompt?.identifier),
+      ...afterPrompts.map(prompt => prompt?.identifier),
+    ])].filter(Boolean);
+    const changes = [];
+
+    for (const identifier of identifiers) {
+      const beforePrompt = beforePrompts.find(prompt => prompt?.identifier === identifier);
+      const afterPrompt = afterPrompts.find(prompt => prompt?.identifier === identifier);
+      if (!beforePrompt && afterPrompt) {
+        changes.push({ identifier, type: 'added', name: afterPrompt.name });
+      } else if (beforePrompt && !afterPrompt) {
+        changes.push({ identifier, type: 'removed', name: beforePrompt.name });
+      } else if (beforePrompt && afterPrompt) {
+        const fields = [];
+        for (const [field, isBoolean] of [['name', false], ['role', false], ['content', false], ['system_prompt', true], ['injection_position', false], ['injection_depth', false], ['injection_order', false], ['forbid_overrides', true]]) {
+          const beforeValue = isBoolean ? Boolean(beforePrompt[field]) : String(beforePrompt[field] ?? '');
+          const afterValue = isBoolean ? Boolean(afterPrompt[field]) : String(afterPrompt[field] ?? '');
+          if (beforeValue !== afterValue) fields.push(field);
+        }
+        if (promptEnabled(before, identifier) !== promptEnabled(after, identifier)) fields.push('enabled');
+        if (fields.length) changes.push({ identifier, type: 'changed', name: afterPrompt.name, fields });
+      }
+    }
+
+    return changes;
+  }
+
+  function changedIdentifiers(name) {
+    const backup = latestBackupFor(name);
+    const current = getPreset(name);
+    if (!backup || !current) return new Set();
+    return new Set(diffPreset(backup.preset, current).map(change => change.identifier));
   }
 
   async function togglePrompt(identifier, enabled) {
@@ -870,6 +964,7 @@
     await savePresetObject(name, preset);
     render();
     setStatus(enabled ? '条目已开启' : '条目已关闭', 'ok');
+    await showDiffDialog(name);
   }
 
   async function toggleModule(moduleId, enabled) {
@@ -888,6 +983,7 @@
     await savePresetObject(name, preset);
     render();
     setStatus(`${enabled ? '开启' : '关闭'}了 ${affected} 个条目`, 'ok');
+    await showDiffDialog(name);
   }
 
   async function createModuleBinding(name, moduleId) {
@@ -973,13 +1069,13 @@
     await savePresetObject(name, preset);
     render();
     setStatus(`${enabled ? '开启' : '关闭'}了 ${affected} 个模块`, 'ok');
+    await showDiffDialog(name);
   }
 
   async function switchPreset(name) {
     const manager = chatCompletionManager();
     const value = manager.findPreset(name);
     if (!value) return;
-    if (state.serverState.settings.autoBackup) await backupPreset(currentPresetName(), 'auto');
     manager.selectPreset(value);
     state.selectedPreset = name;
     presetMeta(name).lastUsed = Date.now();
@@ -1003,6 +1099,7 @@
     await refreshBackups();
     render();
     setStatus(`已恢复 ${targetName}`, 'ok');
+    await showDiffDialog(targetName);
   }
 
   async function refreshBackups() {
@@ -1080,6 +1177,10 @@
 
   function bindShellEvents() {
     document.querySelector('#pwFab').addEventListener('click', () => {
+      if (state.fabDragged) {
+        state.fabDragged = false;
+        return;
+      }
       state.open = !state.open;
       document.querySelector('#pwOverlay').classList.toggle('is-open', state.open);
       if (state.open) render();
@@ -1224,6 +1325,7 @@
             await refreshBackups();
             render();
             setStatus('模块已应用并绑定到当前预设', 'ok');
+            await showDiffDialog(name);
           }
         },
         pwDeleteModule: async () => {
@@ -1394,6 +1496,48 @@
     header.addEventListener('pointercancel', stop);
   }
 
+  function bindFabDrag() {
+    const fab = document.querySelector('#pwFab');
+    if (!fab) return;
+    let dragging = false;
+    let moved = false;
+    let startX = 0;
+    let startY = 0;
+    let rect = null;
+
+    fab.addEventListener('pointerdown', event => {
+      dragging = true;
+      moved = false;
+      startX = event.clientX;
+      startY = event.clientY;
+      rect = fab.getBoundingClientRect();
+      fab.setPointerCapture(event.pointerId);
+    });
+
+    fab.addEventListener('pointermove', event => {
+      if (!dragging) return;
+      const dx = event.clientX - startX;
+      const dy = event.clientY - startY;
+      if (Math.abs(dx) < 5 && Math.abs(dy) < 5) return;
+      moved = true;
+      fab.style.right = 'auto';
+      fab.style.bottom = 'auto';
+      const left = Math.max(0, Math.min(window.innerWidth - fab.offsetWidth, rect.left + dx));
+      const top = Math.max(0, Math.min(window.innerHeight - fab.offsetHeight, rect.top + dy));
+      fab.style.left = `${left}px`;
+      fab.style.top = `${top}px`;
+    });
+
+    const stop = event => {
+      if (!dragging) return;
+      dragging = false;
+      if (moved) state.fabDragged = true;
+      try { fab.releasePointerCapture(event.pointerId); } catch { /* pointer already released */ }
+    };
+    fab.addEventListener('pointerup', stop);
+    fab.addEventListener('pointercancel', stop);
+  }
+
   async function init() {
     const contextValue = context();
     if (!contextValue) {
@@ -1407,6 +1551,7 @@
     render();
     bindShellEvents();
     bindDrag();
+    bindFabDrag();
     bindPresetEvents();
     state.selectedPreset = currentPresetName();
     render();
