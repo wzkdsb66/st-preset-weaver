@@ -145,6 +145,7 @@
         autoBackup: input.settings.autoBackup === true,
         backupRetention: Math.max(1, Math.min(500, Number(input.settings.backupRetention) || 50)),
         theme: input.settings.theme === 'light' ? 'light' : 'dark',
+        positions: isRecord(input.settings.positions) ? input.settings.positions : {},
       };
     }
     return result;
@@ -183,6 +184,7 @@
         autoBackup: true,
         backupRetention: 50,
         theme: 'dark',
+        positions: {},
       },
     };
   }
@@ -534,6 +536,7 @@
           : `<div class="pw-field"><label>内容</label><textarea class="pw-textarea" id="pwModuleContent">${escapeHtml(module.content || '')}</textarea></div>`}
         <div style="display:flex; gap:8px;">
           <button class="pw-button primary" id="pwSaveModule" type="button">保存模块</button>
+          <button class="pw-button" id="pwCopyModule" type="button">复制副本到预设</button>
           <button class="pw-button" id="pwApplyModule" type="button">应用到当前预设</button>
           <button class="pw-button" id="pwDeleteModule" type="button">删除</button>
         </div>
@@ -614,7 +617,8 @@
           <button class="pw-button" id="pwExportButton" type="button">导出全部数据</button>
           <label class="pw-button" style="display:flex; align-items:center;">导入<input id="pwImportInput" class="pw-hidden" type="file" accept="application/json"></label>
         </div></div>
-        <div class="pw-field"><label>存储说明</label><div>数据保存在当前浏览器的 SillyTavern 本地存储中；跨设备迁移请使用导出/导入。</div></div>
+       <div class="pw-field"><label>存储说明</label><div>数据保存在当前浏览器的 SillyTavern 本地存储中；跨设备迁移请使用导出/导入。</div></div>
+        <div class="pw-field"><label>窗口位置</label><div style="display:flex; gap:8px;"><button class="pw-button" id="pwResetPositions" type="button">重置悬浮窗与按钮位置</button></div></div>
       </div>
     `;
   }
@@ -628,10 +632,29 @@
     else right.innerHTML = renderSettingsRight();
   }
 
+  function applyPositions() {
+    const positions = state.serverState?.settings?.positions || {};
+    const windowEl = document.querySelector('#pwWindow');
+    if (windowEl && positions.window) {
+      windowEl.style.position = 'absolute';
+      windowEl.style.left = `${positions.window.left}px`;
+      windowEl.style.top = `${positions.window.top}px`;
+      windowEl.style.margin = '0';
+    }
+    const fab = document.querySelector('#pwFab');
+    if (fab && positions.fab) {
+      fab.style.right = 'auto';
+      fab.style.bottom = 'auto';
+      fab.style.left = `${positions.fab.left}px`;
+      fab.style.top = `${positions.fab.top}px`;
+    }
+  }
+
   function render() {
     if (!state.serverState) return;
     const windowElement = document.querySelector('#pwWindow');
     windowElement.classList.toggle('pw-light', state.serverState.settings.theme === 'light');
+    applyPositions();
     document.querySelector('#pwThemeButton').textContent = state.serverState.settings.theme === 'light' ? '🌙' : '☀️';
     document.querySelector('#pwCurrent').textContent = `当前：${currentPresetName()}`;
     document.querySelector('#pwSearch').value = state.search;
@@ -1049,6 +1072,89 @@
     return identifiers;
   }
 
+  async function copyModuleToPreset(moduleId, targetName) {
+    const contextValue = context();
+    const original = state.serverState.modules[moduleId];
+    const preset = getPreset(targetName);
+    if (!original || !preset) throw new Error('模块或目标预设不存在。');
+    if (original.presetName && original.presetName === targetName) {
+      notify('该模块已属于此预设。');
+      return null;
+    }
+
+    if (state.serverState.settings.autoBackup) await backupPreset(targetName, 'auto');
+    const newId = contextValue.uuidv4();
+    const now = Date.now();
+    const copy = { ...clone(original), id: newId, presetName: targetName, createdAt: now, updatedAt: now };
+    state.serverState.modules[newId] = copy;
+
+    const extension = clone(extensionData(preset));
+    extension.schemaVersion = 1;
+    extension.modules = extension.modules || {};
+    let identifier = copy.sourceIdentifier || `pw_${newId}`;
+    const promptFields = {
+      name: copy.name || '未命名模块',
+      role: copy.role,
+      content: copy.content,
+      system_prompt: Boolean(copy.system_prompt),
+      position: copy.position,
+      injection_position: copy.injection_position,
+      injection_depth: copy.injection_depth,
+      injection_order: copy.injection_order,
+      forbid_overrides: Boolean(copy.forbid_overrides),
+      injection_trigger: clone(copy.injection_trigger || []),
+    };
+    const existingPrompt = promptByIdentifier(preset, identifier);
+    if (existingPrompt) {
+      Object.assign(existingPrompt, promptFields);
+    } else {
+      if (preset.prompts.some(prompt => prompt?.identifier === identifier)) identifier = `${identifier}_${now}`;
+      preset.prompts.push({ identifier, ...promptFields, marker: false });
+    }
+    setPromptEnabled(preset, identifier, true);
+    extension.modules[identifier] = { moduleId: newId, boundAt: now };
+    preset.extensions = { ...(preset.extensions || {}), [EXTENSION_KEY]: extension };
+    await savePresetObject(targetName, preset);
+    await persistState();
+    return { newId, identifier };
+  }
+
+  function openCopyDialog(moduleId) {
+    const original = state.serverState.modules[moduleId];
+    if (!original) return;
+    const targets = allPresetNames().filter(name => name !== original.presetName);
+    if (!targets.length) {
+      notify('没有可复制的目标预设。');
+      return;
+    }
+    openDialog('复制模块副本到预设', `
+      <p>将创建独立副本并绑定到选中的预设，原模块不受影响。</p>
+      <div class="pw-sync-list">
+        ${targets.map(name => `<label class="pw-checkbox"><input type="checkbox" value="${escapeHtml(name)}"><span>${escapeHtml(name)}</span></label>`).join('')}
+      </div>
+    `, '复制');
+    document.querySelector('#pwDialogAccept').onclick = async () => {
+      const selected = [...document.querySelectorAll('#pwDialogBody input:checked')].map(item => item.value);
+      closeDialog();
+      const newIds = [];
+      for (const name of selected) {
+        try {
+          const result = await copyModuleToPreset(moduleId, name);
+          if (result) newIds.push(result.newId);
+        } catch (error) {
+          notify(`${name}: ${error.message}`, 'error');
+        }
+      }
+      if (newIds.length) {
+        state.view = 'modules';
+        state.selectedModule = newIds[0];
+      }
+      await refreshBackups();
+      render();
+      setStatus(`已复制 ${newIds.length} 个副本`, 'ok');
+    };
+  }
+
   async function toggleGroup(groupId, enabled) {
     const name = currentPresetName();
     const group = state.serverState.groups[groupId];
@@ -1128,9 +1234,10 @@
       const identifiers = Object.entries(extension.modules || {})
         .filter(([, value]) => value?.moduleId === moduleId)
         .map(([identifier]) => identifier);
-      if (!identifiers.length) continue;
-      for (const identifier of identifiers) delete extension.modules[identifier];
-      await manager.writePresetExtensionField({ name, path: EXTENSION_KEY, value: extension });
+     if (!identifiers.length) continue;
+      if (state.serverState.settings.autoBackup) await backupPreset(name, 'auto');
+     for (const identifier of identifiers) delete extension.modules[identifier];
+     await manager.writePresetExtensionField({ name, path: EXTENSION_KEY, value: extension });
     }
   }
 
@@ -1308,27 +1415,28 @@
           setStatus('模块已保存，请确认同步范围', 'ok');
           openSyncDialog(module.id);
         },
-        pwApplyModule: async () => {
-          const name = currentPresetName();
-          const preset = getPreset(name);
-          const module = state.serverState.modules[state.selectedModule];
-          if (!name || !preset || !module) return;
-          if (module.presetName && module.presetName !== name) {
-            notify('该模块为预设私有，不能应用到其他预设。', 'warning');
-            return;
-          }
-          if (state.serverState.settings.autoBackup) await backupPreset(name, 'auto');
-          if (boundIdentifiers(preset, state.selectedModule).length) {
-            await syncModule(state.selectedModule, [name]);
-          } else {
-            await createModuleBinding(name, state.selectedModule);
-            await refreshBackups();
-            render();
-            setStatus('模块已应用并绑定到当前预设', 'ok');
-            await showDiffDialog(name);
-          }
-        },
-        pwDeleteModule: async () => {
+       pwApplyModule: async () => {
+         const name = currentPresetName();
+         const preset = getPreset(name);
+         const module = state.serverState.modules[state.selectedModule];
+         if (!name || !preset || !module) return;
+         if (module.presetName && module.presetName !== name) {
+           notify('该模块为预设私有，不能应用到其他预设。', 'warning');
+           return;
+         }
+         if (state.serverState.settings.autoBackup) await backupPreset(name, 'auto');
+         if (boundIdentifiers(preset, state.selectedModule).length) {
+           await syncModule(state.selectedModule, [name]);
+         } else {
+           await createModuleBinding(name, state.selectedModule);
+           await refreshBackups();
+           render();
+           setStatus('模块已应用并绑定到当前预设', 'ok');
+           await showDiffDialog(name);
+         }
+       },
+        pwCopyModule: () => openCopyDialog(state.selectedModule),
+       pwDeleteModule: async () => {
           const moduleId = state.selectedModule;
           confirmAction('删除模块', '模块会从模块库删除，并解除所有预设绑定；预设中的原提示词内容不会被删除。', async () => {
             await removeModuleBindings(moduleId);
@@ -1368,12 +1476,22 @@
           render();
           setStatus('已创建手动备份', 'ok');
         },
-        pwExportButton: async () => downloadExport({
-          schemaVersion: 1,
-          exportedAt: new Date().toISOString(),
-          state: clone(state.serverState),
-          backups: clone(state.serverState.backups || []),
-        }),
+       pwExportButton: async () => downloadExport({
+         schemaVersion: 1,
+         exportedAt: new Date().toISOString(),
+         state: clone(state.serverState),
+         backups: clone(state.serverState.backups || []),
+       }),
+        pwResetPositions: () => {
+          state.serverState.settings.positions = {};
+          ['left', 'top', 'right', 'bottom', 'margin', 'position'].forEach(prop => {
+            document.querySelector('#pwWindow')?.style.removeProperty(prop);
+            document.querySelector('#pwFab')?.style.removeProperty(prop);
+          });
+          queueServerStateSave();
+          render();
+          setStatus('已重置窗口与按钮位置', 'ok');
+        },
       };
 
       if (actions[event.target.id]) await actions[event.target.id]();
@@ -1490,6 +1608,12 @@
     const stop = event => {
       if (!dragging) return;
       dragging = false;
+      state.serverState.settings.positions = state.serverState.settings.positions || {};
+      state.serverState.settings.positions.window = {
+        left: Number(windowEl.style.left?.replace('px', '') || 0),
+        top: Number(windowEl.style.top?.replace('px', '') || 0),
+      };
+      queueServerStateSave();
       try { header.releasePointerCapture(event.pointerId); } catch { /* pointer already released */ }
     };
     header.addEventListener('pointerup', stop);
@@ -1532,6 +1656,14 @@
       if (!dragging) return;
       dragging = false;
       if (moved) state.fabDragged = true;
+      if (moved) {
+        state.serverState.settings.positions = state.serverState.settings.positions || {};
+        state.serverState.settings.positions.fab = {
+          left: Number(fab.style.left?.replace('px', '') || 0),
+          top: Number(fab.style.top?.replace('px', '') || 0),
+        };
+        queueServerStateSave();
+      }
       try { fab.releasePointerCapture(event.pointerId); } catch { /* pointer already released */ }
     };
     fab.addEventListener('pointerup', stop);
